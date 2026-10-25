@@ -40,10 +40,13 @@ public class AdbClient {
     private static final int AUTH_TOKEN = 1;
     private static final int AUTH_SIGNATURE = 2;
     private static final int AUTH_RSAPUBLICKEY = 3;
-    private static final int A_VERSION = 0x01000000;
-    private static final int MAX_PAYLOAD = 4096;
+    // 官方 platform-tools 34+ 实测值: Sony adbd 对 0x01000000 静默丢弃连接
+    private static final int A_VERSION = 0x01000001;
+    private static final int MAX_PAYLOAD = 0x100000; // 1MB, 与官方一致
     private static final String KEY_ALIAS = "tvpower-adb-key";
-    private static final String BANNER = "host::features=shell_v2";
+    // 官方 platform-tools 34+ 完整 host banner (286 bytes, 抓包所得)
+    private static final String BANNER = "host::features=shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir,apex,abb,fixed_push_symlink_timestamp,abb_exec,remount_shell,track_app,sendrecv_v2,sendrecv_v2_brotli,sendrecv_v2_lz4,sendrecv_v2_zstd,sendrecv_v2_dry_run_send,devicetracker_proto_format,devraw,app_info,server_status,track_mdns";
+    private static final String TAG = "tvpower";
 
     private static class AdbMessage {
         final int cmd, arg0, arg1;
@@ -80,6 +83,7 @@ public class AdbClient {
         close();
         if (!useInjectedKey) ensureKeys();
 
+        android.util.Log.i(TAG, "connect: " + host + ":" + port + " injected=" + useInjectedKey);
         Socket s = new Socket();
         s.connect(new InetSocketAddress(host, port), connectTimeoutMs);
         s.setTcpNoDelay(true);
@@ -89,39 +93,66 @@ public class AdbClient {
         input = new DataInputStream(s.getInputStream());
 
         writeMessage(A_CNXN, A_VERSION, MAX_PAYLOAD, BANNER.getBytes(StandardCharsets.UTF_8));
+        android.util.Log.i(TAG, "connect: CNWN sent");
 
+        int round = 0;
         while (true) {
             AdbMessage msg = readMessage();
             if (msg == null) throw new Exception("连接中断(认证阶段)");
-            if (msg.cmd == A_CNXN) return; // 认证通过
+            if (msg.cmd == A_CNXN) {
+                android.util.Log.i(TAG, "connect: CNWN received, AUTH PASSED after " + round + " rounds");
+                return; // 认证通过
+            }
             if (msg.cmd == A_AUTH && msg.arg0 == AUTH_TOKEN) {
+                round++;
+                android.util.Log.i(TAG, "connect: AUTH TOKEN round " + round);
                 byte[] sig = signToken(msg.data);
                 if (sig != null) {
                     writeMessage(A_AUTH, AUTH_SIGNATURE, 0, sig);
+                    android.util.Log.i(TAG, "connect: AUTH SIGNATURE sent (" + sig.length + " bytes)");
                 } else if (publicKeyDer != null) {
                     byte[] buf = new byte[publicKeyDer.length + 1]; // DER + '\0'
                     System.arraycopy(publicKeyDer, 0, buf, 0, publicKeyDer.length);
                     writeMessage(A_AUTH, AUTH_RSAPUBLICKEY, 0, buf);
+                    android.util.Log.i(TAG, "connect: RSAPUBLICKEY sent");
                 } else {
                     throw new Exception("私钥签名失败");
                 }
             } else {
-                throw new Exception("意外协议响应");
+                throw new Exception("意外协议响应 cmd=0x" + Integer.toHexString(msg.cmd));
             }
         }
     }
 
     /**
      * 打开 shell 流执行命令, 发出即返回 (reboot -p 送达后设备即断电)。
+     *
+     * @return true = 命令已被接受且设备开始断电 (流断开)
+     * @throws Exception 连接/协议失败 (调用方应重试或换 host)
      */
-    public void shell(String command, long waitMs) throws Exception {
+    public boolean shell(String command, long waitMs) throws Exception {
         writeMessage(A_OPEN, 1, 0, ("shell:" + command).getBytes(StandardCharsets.UTF_8));
+        boolean okay = false;
         long start = System.currentTimeMillis();
         while (System.currentTimeMillis() - start < waitMs) {
             AdbMessage msg = readMessage();
-            if (msg == null) return; // 设备已重启/断电, 流断开
-            if (msg.cmd == A_OKAY || msg.cmd == A_CLSE) return;
+            if (msg == null) {
+                // 流断开: reboot -p 已生效, 设备正在断电
+                android.util.Log.i(TAG, "shell: stream closed (device powering off)");
+                return true;
+            }
+            if (msg.cmd == A_OKAY) {
+                android.util.Log.i(TAG, "shell: OKAY received");
+                okay = true;
+            } else if (msg.cmd == A_CLSE) {
+                throw new Exception("remote closed stream (CLSE)");
+            }
+            // WRTE 等其他消息: 忽略继续等待
         }
+        if (okay) {
+            throw new Exception("OKAY received but stream stayed open (command not executed?)");
+        }
+        throw new Exception("no response to OPEN shell:" + command);
     }
 
     public void close() {

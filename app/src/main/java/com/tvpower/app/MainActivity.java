@@ -155,21 +155,28 @@ public class MainActivity extends Activity {
     /** key 非空 = 注入私钥直连; key = null = AndroidKeyStore + 弹窗路线 */
     private void shutdown(final PrivateKey key) {
         runOnUiThread(() -> statusText.setText("正在关机…"));
+        // 127.0.0.1 优先: 避免与电脑 adb 连接「撞源 IP」, 且环路不受 WiFi 影响
         final List<String> hosts = new ArrayList<>();
-        hosts.addAll(localIpCandidates());
         hosts.add("127.0.0.1");
+        hosts.addAll(localIpCandidates());
         String lastErr = "未知错误";
         for (String host : hosts) {
-            AdbClient client = null;
-            try {
-                client = new AdbClient(key);
-                client.connect(host, 5555, 5000, 8000);
-                client.shell("reboot -p", 3000);
-                return; // 已断电, 不会回来
-            } catch (Exception e) {
-                lastErr = host + " — " + e.getMessage();
-            } finally {
-                if (client != null) client.close();
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                AdbClient client = null;
+                try {
+                    client = new AdbClient(key);
+                    // connect 5s + auth 15s: Sony adbd 握手每步可达 1s, 需放宽
+                    client.connect(host, 5555, 5000, 15000);
+                    if (client.shell("reboot -p", 6000)) {
+                        return; // 已断电, 不会回来
+                    }
+                    lastErr = host + " — shell 未确认";
+                } catch (Exception e) {
+                    lastErr = host + " (第" + attempt + "次) — " + e.getMessage();
+                } finally {
+                    if (client != null) client.close();
+                }
+                sleepQuietly(1000); // Sony adbd 每秒重建 USB transport, 间隔重试提高命中率
             }
         }
         final String err = lastErr;
