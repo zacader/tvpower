@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 电源符号: 圆环 + 顶部竖线 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M54,28A26,26 0 1,1 53.99,28ZM54,36A18,18 0 1,0 53.99,36Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M52,14h4v22h-4z" />
+</vector>

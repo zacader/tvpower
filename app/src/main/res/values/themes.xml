@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TVPower" parent="android:Theme.Material.NoActionBar">
+        <item name="android:colorAccent">#3E63DD</item>
+        <item name="android:windowBackground">#101418</item>
+    </style>
+</resources>
