@@ -6,6 +6,7 @@ import android.view.Gravity;
 import android.widget.TextView;
 
 import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.List;
@@ -73,9 +74,10 @@ public class MainActivity extends Activity {
         try {
             for (NetworkInterface nif : java.util.Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 if (nif.getName().startsWith("wlan") || nif.getName().startsWith("eth")) {
-                    for (java.util.Enumeration<Inet4Address> addrs = nif.getInetAddresses(); addrs.hasMoreElements(); ) {
-                        Inet4Address a = addrs.nextElement();
-                        if (a.getHostAddress() != null) result.add(a.getHostAddress());
+                    for (InetAddress a : java.util.Collections.list(nif.getInetAddresses())) {
+                        if (a instanceof Inet4Address && a.getHostAddress() != null) {
+                            result.add(a.getHostAddress());
+                        }
                     }
                 }
             }
