@@ -161,7 +161,7 @@ public class AdbClient {
         DerReader r = new DerReader(der);
         r.expect(0x30);              // SEQUENCE
         r.readLength();
-        r.expect(0x02); r.readLength(); r.readBytes();          // version
+        r.expect(0x02); int lv = r.readLength(); r.readBytes(lv); // version
         r.expect(0x02); int ln = r.readLength(); byte[] modulus = r.readBytes(ln);
         r.expect(0x02); int le = r.readLength(); r.readBytes(le); // publicExponent
         r.expect(0x02); int ld = r.readLength(); byte[] privExp = r.readBytes(ld);
