@@ -205,12 +205,16 @@ public class MainActivity extends Activity {
     }
 
     private static byte[] readAll(File f) throws Exception {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (InputStream in = new FileInputStream(f)) {
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            return readAll(in);
         }
+    }
+
+    private static byte[] readAll(InputStream in) throws Exception {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
         return bos.toByteArray();
     }
 
