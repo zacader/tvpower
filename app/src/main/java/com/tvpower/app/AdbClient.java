@@ -9,19 +9,25 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.RSAPrivateKeySpec;
+import java.util.Base64;
 import java.util.zip.CRC32;
 
 /**
- * 最小 ADB 协议客户端 (仅实现关机所需子集):
- *   TCP -> CNXN 握手 -> AUTH (RSA 签名 / 公钥注册) -> OPEN "shell:reboot -p"
+ * 最小 ADB 协议客户端 (关机所需子集):
+ *   TCP -> CNXN 握手 -> AUTH (RSA 签名) -> OPEN "shell:reboot -p"
  *
- * 密钥对存放于 AndroidKeyStore (别名 tvpower-adb-key)。首次连接时电视端
- * 弹出 "允许 USB 调试?" 授权框, 用户点允许后进入 CNXN。
+ * 两种密钥来源:
+ *   1) 外部注入私钥 (电脑 adbkey) — 公钥已在电视授权列表, adbd 验签通过即授权, 无需弹窗
+ *   2) AndroidKeyStore 自生成 — 首次连接需电视端弹"允许 USB 调试?"
  */
 public class AdbClient {
 
@@ -51,18 +57,28 @@ public class AdbClient {
         }
     }
 
+    private final boolean useInjectedKey;
     private Socket socket;
     private DataOutputStream out;
     private DataInputStream input;
     private PrivateKey privateKey;
     private byte[] publicKeyDer;
 
+    /** 注入外部私钥 (电脑 adbkey); 传 null 则走 AndroidKeyStore 自生成 + 弹窗授权 */
+    public AdbClient(PrivateKey injectedKey) {
+        this.useInjectedKey = (injectedKey != null);
+        this.privateKey = injectedKey;
+    }
+
     /**
-     * 连接并完成认证。authTimeoutMs 需足够长 (等待用户在电视上点"允许")。
+     * 连接并完成认证。
+     *
+     * @param connectTimeoutMs TCP 连接超时
+     * @param authTimeoutMs    认证阶段读超时 (注入密钥验签直接通过, 通常 <100ms)
      */
     public void connect(String host, int port, int connectTimeoutMs, int authTimeoutMs) throws Exception {
         close();
-        ensureKeys();
+        if (!useInjectedKey) ensureKeys();
 
         Socket s = new Socket();
         s.connect(new InetSocketAddress(host, port), connectTimeoutMs);
@@ -72,7 +88,7 @@ public class AdbClient {
         out = new DataOutputStream(s.getOutputStream());
         input = new DataInputStream(s.getInputStream());
 
-        writeMessage(A_CNXN, A_VERSION, MAX_PAYLOAD, BANNER.getBytes("UTF-8"));
+        writeMessage(A_CNXN, A_VERSION, MAX_PAYLOAD, BANNER.getBytes(StandardCharsets.UTF_8));
 
         while (true) {
             AdbMessage msg = readMessage();
@@ -82,10 +98,12 @@ public class AdbClient {
                 byte[] sig = signToken(msg.data);
                 if (sig != null) {
                     writeMessage(A_AUTH, AUTH_SIGNATURE, 0, sig);
-                } else {
+                } else if (publicKeyDer != null) {
                     byte[] buf = new byte[publicKeyDer.length + 1]; // DER + '\0'
                     System.arraycopy(publicKeyDer, 0, buf, 0, publicKeyDer.length);
                     writeMessage(A_AUTH, AUTH_RSAPUBLICKEY, 0, buf);
+                } else {
+                    throw new Exception("私钥签名失败");
                 }
             } else {
                 throw new Exception("意外协议响应");
@@ -97,7 +115,7 @@ public class AdbClient {
      * 打开 shell 流执行命令, 发出即返回 (reboot -p 送达后设备即断电)。
      */
     public void shell(String command, long waitMs) throws Exception {
-        writeMessage(A_OPEN, 1, 0, ("shell:" + command).getBytes("UTF-8"));
+        writeMessage(A_OPEN, 1, 0, ("shell:" + command).getBytes(StandardCharsets.UTF_8));
         long start = System.currentTimeMillis();
         while (System.currentTimeMillis() - start < waitMs) {
             AdbMessage msg = readMessage();
@@ -114,6 +132,77 @@ public class AdbClient {
         socket = null;
         out = null;
         input = null;
+    }
+
+    // ---------------- 密钥解析 ----------------
+
+    /** 解析 PEM 私钥 (PKCS#8 "BEGIN PRIVATE KEY" 或 PKCS#1 "BEGIN RSA PRIVATE KEY") */
+    public static PrivateKey parsePrivateKeyPem(byte[] pemBytes) throws Exception {
+        String text = new String(pemBytes, StandardCharsets.US_ASCII).trim();
+        String body;
+        byte[] der;
+        if (text.contains("-----BEGIN PRIVATE KEY-----")) {
+            body = text.replace("-----BEGIN PRIVATE KEY-----", "")
+                    .replace("-----END PRIVATE KEY-----", "");
+            der = Base64.getMimeDecoder().decode(body);
+            return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(der));
+        }
+        if (text.contains("-----BEGIN RSA PRIVATE KEY-----")) {
+            body = text.replace("-----BEGIN RSA PRIVATE KEY-----", "")
+                    .replace("-----END RSA PRIVATE KEY-----", "");
+            der = Base64.getMimeDecoder().decode(body);
+            return parsePkcs1Rsa(der);
+        }
+        throw new Exception("无法识别的密钥格式 (需要 PEM 私钥)");
+    }
+
+    /** PKCS#1 RSAPrivateKey ::= SEQUENCE { version, n, e, d, ... } — 签名只需 n 与 d */
+    private static PrivateKey parsePkcs1Rsa(byte[] der) throws Exception {
+        DerReader r = new DerReader(der);
+        r.expect(0x30);              // SEQUENCE
+        r.readLength();
+        r.expect(0x02); r.readLength(); r.readBytes();          // version
+        r.expect(0x02); int ln = r.readLength(); byte[] modulus = r.readBytes(ln);
+        r.expect(0x02); int le = r.readLength(); r.readBytes(le); // publicExponent
+        r.expect(0x02); int ld = r.readLength(); byte[] privExp = r.readBytes(ld);
+        return KeyFactory.getInstance("RSA").generatePrivate(
+                new RSAPrivateKeySpec(toBigInt(modulus), toBigInt(privExp)));
+    }
+
+    /** DER INTEGER (二进制补码) -> BigInteger */
+    private static java.math.BigInteger toBigInt(byte[] derInt) {
+        return new java.math.BigInteger(derInt);
+    }
+
+    private static class DerReader {
+        private final byte[] buf;
+        private int pos;
+
+        DerReader(byte[] b) {
+            this.buf = b;
+        }
+
+        void expect(int tag) throws Exception {
+            if (pos >= buf.length || (buf[pos] & 0xff) != tag)
+                throw new Exception("DER 格式错误 @" + pos);
+            pos++;
+        }
+
+        int readLength() throws Exception {
+            int b = buf[pos++] & 0xff;
+            if ((b & 0x80) == 0) return b;
+            int n = b & 0x7f;
+            int len = 0;
+            for (int i = 0; i < n; i++) len = (len << 8) | (buf[pos++] & 0xff);
+            return len;
+        }
+
+        byte[] readBytes(int n) {
+            byte[] out = new byte[n];
+            System.arraycopy(buf, pos, out, 0, n);
+            pos += n;
+            return out;
+        }
     }
 
     // ---------------- 内部实现 ----------------
