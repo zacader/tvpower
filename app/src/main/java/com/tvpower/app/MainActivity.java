@@ -23,13 +23,12 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * 电视电源 — 打开即关机 (reboot -p)。
+ * 电视电源 — 打开即关机。
  *
- * 首次使用需导入电脑上的 adbkey 私钥 (一次性):
- *   电脑 PowerShell 运行:
- *   adb push %USERPROFILE%\.android\adbkey /sdcard/Android/data/com.tvpower.app/files/adbkey
- * 导入后 App 以该私钥连接本机 adbd — 对应公钥已在电视授权列表内,
- * adbd 验签通过即直接授权, 无需任何弹窗。
+ * 关机路线 (按序尝试):
+ *   1) setprop sys.powerctl shutdown — 零密钥/零弹窗/零网络, 索尼固件实测可用
+ *   2) ADB + 注入私钥 (电脑 adbkey) — 回退路线, 需一次性导入:
+ *      adb push %USERPROFILE%\.android\adbkey /sdcard/Android/data/com.tvpower.app/files/adbkey
  */
 public class MainActivity extends Activity {
 
@@ -105,6 +104,12 @@ public class MainActivity extends Activity {
     }
 
     private void startFlow() {
+        // 路线 1: sys.powerctl (索尼固件实测: App 身份可写, 任何非空值即触发关机)
+        if (trySetpropShutdown()) {
+            runOnUiThread(() -> statusText.setText("正在关机…"));
+            sleepQuietly(3000); // 给系统关机流程留时间; 成功则本进程已被杀, 不会回来
+        }
+        // 路线 2: ADB + 注入私钥 (回退)
         try {
             adbKey = loadKeyWithImport();
         } catch (Exception e) {
@@ -117,12 +122,34 @@ public class MainActivity extends Activity {
         }
         if (adbKey == null) {
             runOnUiThread(() -> {
-                statusText.setText("等待导入 adbkey…");
+                statusText.setText("关机失败：setprop 路线无效，且未导入 adbkey");
                 importPanel.setVisibility(View.VISIBLE);
             });
             return;
         }
         shutdown(adbKey);
+    }
+
+    /** 路线 1: 直接 setprop 关机。返回 true = 指令已被系统接受 (随即断电) */
+    private boolean trySetpropShutdown() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("/system/bin/setprop", "sys.powerctl", "shutdown");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            byte[] out = readAll(p.getInputStream());
+            int exit = p.waitFor();
+            String s = new String(out, "UTF-8").toLowerCase();
+            return exit == 0 && !s.contains("fail");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {
+        }
     }
 
     /** key 非空 = 注入私钥直连; key = null = AndroidKeyStore + 弹窗路线 */
