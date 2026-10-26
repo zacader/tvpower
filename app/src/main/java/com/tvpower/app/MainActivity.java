@@ -14,6 +14,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -103,31 +105,29 @@ public class MainActivity extends Activity {
         return panel;
     }
 
+    /**
+     * v1.5: 自包含 ADB 路线被索尼定制 adbd 拒绝(仅认标准 adb.exe), 改为 UDP 广播触发电脑端执行 `adb reboot -p`。
+     * 打开 App 即发广播, 电脑监听到后关机。
+     */
     private void startFlow() {
-        // 路线 1: sys.powerctl (索尼固件实测: App 身份可写, 任何非空值即触发关机)
-        if (trySetpropShutdown()) {
-            runOnUiThread(() -> statusText.setText("正在关机…"));
-            sleepQuietly(3000); // 给系统关机流程留时间; 成功则本进程已被杀, 不会回来
-        }
-        // 路线 2: ADB + 注入私钥 (回退)
         try {
-            adbKey = loadKeyWithImport();
+            sendUdpBroadcast("TVPOWER_OFF");
+            runOnUiThread(() -> statusText.setText("已发送关机指令，等待电脑执行…"));
         } catch (Exception e) {
             final String msg = e.getMessage();
-            runOnUiThread(() -> {
-                statusText.setText("密钥导入失败：" + msg);
-                importPanel.setVisibility(View.VISIBLE);
-            });
-            return;
+            runOnUiThread(() -> statusText.setText("发送失败：" + msg));
         }
-        if (adbKey == null) {
-            runOnUiThread(() -> {
-                statusText.setText("关机失败：setprop 路线无效，且未导入 adbkey");
-                importPanel.setVisibility(View.VISIBLE);
-            });
-            return;
-        }
-        shutdown(adbKey);
+    }
+
+    /** 发送 UDP 广播, 通知电脑端执行关机 */
+    private void sendUdpBroadcast(String msg) throws Exception {
+        DatagramSocket sock = new DatagramSocket();
+        sock.setBroadcast(true);
+        byte[] data = msg.getBytes("UTF-8");
+        DatagramPacket p = new DatagramPacket(data, data.length,
+                InetAddress.getByName("255.255.255.255"), 54321);
+        sock.send(p);
+        sock.close();
     }
 
     /** 路线 1: 直接 setprop 关机。返回 true = 指令已被系统接受 (随即断电)。
