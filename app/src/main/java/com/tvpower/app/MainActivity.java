@@ -130,16 +130,25 @@ public class MainActivity extends Activity {
         shutdown(adbKey);
     }
 
-    /** 路线 1: 直接 setprop 关机。返回 true = 指令已被系统接受 (随即断电) */
+    /** 路线 1: 直接 setprop 关机。返回 true = 指令已被系统接受 (随即断电)。
+     *  非阻塞: 后台消费子进程输出避免管道写满导致 setprop 挂起; 超时 2s 视为未生效, 落到 ADB 路线 */
     private boolean trySetpropShutdown() {
         try {
             ProcessBuilder pb = new ProcessBuilder("/system/bin/setprop", "sys.powerctl", "shutdown");
             pb.redirectErrorStream(true);
             Process p = pb.start();
-            byte[] out = readAll(p.getInputStream());
-            int exit = p.waitFor();
-            String s = new String(out, "UTF-8").toLowerCase();
-            return exit == 0 && !s.contains("fail");
+            // 后台消费输出, 否则 setprop 不关闭 stdout 时会让 read 永远阻塞 (索尼固件实测卡死)
+            Thread drain = new Thread(() -> {
+                try { readAll(p.getInputStream()); } catch (Exception ignored) { }
+            });
+            drain.setDaemon(true);
+            drain.start();
+            boolean finished = p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            if (!finished) {
+                p.destroy();
+                return false;
+            }
+            return p.exitValue() == 0;
         } catch (Exception e) {
             return false;
         }
