@@ -18,6 +18,7 @@ import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
 import java.security.interfaces.RSAPrivateKey;
+import java.security.interfaces.RSAPrivateCrtKey;
 import java.security.PublicKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.RSAPrivateKeySpec;
@@ -92,7 +93,16 @@ public class AdbClient {
             try {
                 KeyFactory kf = KeyFactory.getInstance("RSA");
                 RSAPrivateKey rsaPriv = (RSAPrivateKey) privateKey;
-                RSAPublicKeySpec spec = new RSAPublicKeySpec(rsaPriv.getModulus(), rsaPriv.getPublicExponent());
+                java.math.BigInteger modulus = rsaPriv.getModulus();
+                java.math.BigInteger exponent;
+                if (rsaPriv instanceof RSAPrivateCrtKey) {
+                    // PKCS#8 / CRT 私钥直接持有公钥指数
+                    exponent = ((RSAPrivateCrtKey) rsaPriv).getPublicExponent();
+                } else {
+                    // 非 CRT 私钥 (如 PKCS#1 仅含 n/d): adb 密钥公钥指数恒为 65537
+                    exponent = java.math.BigInteger.valueOf(65537);
+                }
+                RSAPublicKeySpec spec = new RSAPublicKeySpec(modulus, exponent);
                 RSAPublicKey rsaPub = (RSAPublicKey) kf.generatePublic(spec);
                 publicKeyDer = rsaPublicKeyToPkcs1Der(rsaPub);
                 android.util.Log.i(TAG, "connect: derived pubkey DER (" + publicKeyDer.length + " bytes)");
