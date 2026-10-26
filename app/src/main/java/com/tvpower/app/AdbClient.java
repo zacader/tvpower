@@ -5,6 +5,7 @@ import android.security.keystore.KeyProperties;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
@@ -16,8 +17,10 @@ import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.interfaces.RSAPublicKey;
+import java.security.PublicKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.RSAPrivateKeySpec;
+import java.security.spec.RSAPublicKeySpec;
 import java.util.Base64;
 import java.util.zip.CRC32;
 
@@ -81,7 +84,22 @@ public class AdbClient {
      */
     public void connect(String host, int port, int connectTimeoutMs, int authTimeoutMs) throws Exception {
         close();
-        if (!useInjectedKey) ensureKeys();
+        if (!useInjectedKey) {
+            ensureKeys();
+        } else {
+            // 注入私钥场景: 从私钥推导公钥 DER (PKCS#1) 供 AUTH RSAPUBLICKEY 注册使用
+            try {
+                KeyFactory kf = KeyFactory.getInstance("RSA");
+                RSAPrivateKey rsaPriv = (RSAPrivateKey) privateKey;
+                RSAPublicKeySpec spec = new RSAPublicKeySpec(rsaPriv.getModulus(), rsaPriv.getPublicExponent());
+                RSAPublicKey rsaPub = (RSAPublicKey) kf.generatePublic(spec);
+                publicKeyDer = rsaPublicKeyToPkcs1Der(rsaPub);
+                android.util.Log.i(TAG, "connect: derived pubkey DER (" + publicKeyDer.length + " bytes)");
+            } catch (Exception e) {
+                android.util.Log.w(TAG, "connect: derive pubkey failed: " + e.getMessage());
+                publicKeyDer = null;
+            }
+        }
 
         android.util.Log.i(TAG, "connect: " + host + ":" + port + " injected=" + useInjectedKey);
         Socket s = new Socket();
@@ -106,17 +124,24 @@ public class AdbClient {
             if (msg.cmd == A_AUTH && msg.arg0 == AUTH_TOKEN) {
                 round++;
                 android.util.Log.i(TAG, "connect: AUTH TOKEN round " + round);
-                byte[] sig = signToken(msg.data);
-                if (sig != null) {
-                    writeMessage(A_AUTH, AUTH_SIGNATURE, 0, sig);
-                    android.util.Log.i(TAG, "connect: AUTH SIGNATURE sent (" + sig.length + " bytes)");
-                } else if (publicKeyDer != null) {
-                    byte[] buf = new byte[publicKeyDer.length + 1]; // DER + '\0'
-                    System.arraycopy(publicKeyDer, 0, buf, 0, publicKeyDer.length);
-                    writeMessage(A_AUTH, AUTH_RSAPUBLICKEY, 0, buf);
-                    android.util.Log.i(TAG, "connect: RSAPUBLICKEY sent");
+                if (round > 5) throw new Exception("认证失败: 索尼 adbd 拒绝 SIGNATURE 与 RSAPUBLICKEY");
+                if (round == 1) {
+                    byte[] sig = signToken(msg.data);
+                    if (sig != null) {
+                        writeMessage(A_AUTH, AUTH_SIGNATURE, 0, sig);
+                        android.util.Log.i(TAG, "connect: AUTH SIGNATURE sent (" + sig.length + " bytes)");
+                    } else if (publicKeyDer != null) {
+                        sendRsaPublicKey();
+                    } else {
+                        throw new Exception("私钥签名失败");
+                    }
                 } else {
-                    throw new Exception("私钥签名失败");
+                    // round>=2: SIGNATURE 被拒, 改用 AUTH RSAPUBLICKEY 注册公钥 (AOSP adbd 收到即信任并回 CNWN)
+                    if (publicKeyDer != null) {
+                        sendRsaPublicKey();
+                    } else {
+                        throw new Exception("SIGNATURE 被拒且无公钥可注册");
+                    }
                 }
             } else {
                 throw new Exception("意外协议响应 cmd=0x" + Integer.toHexString(msg.cmd));
@@ -257,7 +282,7 @@ public class AdbClient {
         ks2.load(null);
         KeyStore.PrivateKeyEntry entry = (KeyStore.PrivateKeyEntry) ks2.getEntry(KEY_ALIAS, null);
         privateKey = entry.getPrivateKey();
-        publicKeyDer = ((RSAPublicKey) entry.getCertificate().getPublicKey()).getEncoded(); // X.509 SPKI DER
+        publicKeyDer = rsaPublicKeyToPkcs1Der((RSAPublicKey) entry.getCertificate().getPublicKey());
     }
 
     private byte[] signToken(byte[] token) {
@@ -268,6 +293,63 @@ public class AdbClient {
             return sig.sign();
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /** 发送 AUTH RSAPUBLICKEY: 数据 = 公钥 DER(PKCS#1) + 末尾 '\0', AOSP adbd 收到即加入信任并回 CNWN */
+    private void sendRsaPublicKey() throws Exception {
+        if (publicKeyDer == null) throw new Exception("no public key DER");
+        byte[] buf = new byte[publicKeyDer.length + 1]; // DER + '\0'
+        System.arraycopy(publicKeyDer, 0, buf, 0, publicKeyDer.length);
+        writeMessage(A_AUTH, AUTH_RSAPUBLICKEY, 0, buf);
+        android.util.Log.i(TAG, "connect: RSAPUBLICKEY sent (" + buf.length + " bytes)");
+    }
+
+    /** RSAPublicKey -> PKCS#1 RSAPublicKey DER (AOSP adbd 期望的格式, 非 X.509 SPKI) */
+    private static byte[] rsaPublicKeyToPkcs1Der(RSAPublicKey pub) throws Exception {
+        byte[] n = derInt(stripSignByte(pub.getModulus().toByteArray()));
+        byte[] e = derInt(stripSignByte(pub.getPublicExponent().toByteArray()));
+        ByteArrayOutputStream seq = new ByteArrayOutputStream();
+        seq.write(n, 0, n.length);
+        seq.write(e, 0, e.length);
+        return derSequence(seq.toByteArray());
+    }
+
+    /** 去掉 BigInt.toByteArray 冗余的符号扩展 0x00, 但保留真正的正数符号位 0x00 (DER INTEGER 要求) */
+    private static byte[] stripSignByte(byte[] v) {
+        if (v.length > 1 && v[0] == 0 && (v[1] & 0x80) == 0) {
+            byte[] out = new byte[v.length - 1];
+            System.arraycopy(v, 1, out, 0, out.length);
+            return out;
+        }
+        return v;
+    }
+
+    private static byte[] derInt(byte[] content) throws Exception {
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        b.write(0x02);
+        writeDerLen(b, content.length);
+        b.write(content, 0, content.length);
+        return b.toByteArray();
+    }
+
+    private static byte[] derSequence(byte[] body) throws Exception {
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        b.write(0x30);
+        writeDerLen(b, body.length);
+        b.write(body, 0, body.length);
+        return b.toByteArray();
+    }
+
+    private static void writeDerLen(ByteArrayOutputStream b, int len) throws Exception {
+        if (len < 0x80) {
+            b.write(len);
+        } else if (len < 0x100) {
+            b.write(0x81); b.write(len);
+        } else if (len < 0x10000) {
+            b.write(0x82); b.write((len >> 8) & 0xff); b.write(len & 0xff);
+        } else {
+            throw new Exception("DER length too large");
         }
     }
 
